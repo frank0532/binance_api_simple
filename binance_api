@@ -1,0 +1,223 @@
+import hmac
+import time
+import json
+import hashlib
+import requests
+import pandas as pd
+import websocket
+from urllib.parse import urlencode
+
+
+class BinanceAPI:
+    def __init__(self, api_key='', secret_key='', account_type='swap'):
+        self.api_key = api_key
+        self.secret_key = secret_key
+        self.account_type = account_type.lower()
+        self.listen_key = ''
+        if self.account_type == 'spot':
+            self.base_url = "https://api.binance.com"
+            self.wss_url = 'wss://stream.binance.com/ws'
+            self.listen_url = '/api/v3/userDataStream'
+        elif self.account_type == 'swap':
+            self.base_url = "https://fapi.binance.com"
+            self.wss_url = 'wss://fstream.binance.com/ws'
+            self.listen_url = '/fapi/v1/listenKey'
+        else:
+            assert False, f'\033[31mAccountType "{account_type}" is not defined.\033[0m'
+
+    @staticmethod
+    def get_timestamp():
+        return int(time.time() * 1000)
+
+    def hashing(self, query_string):
+        return hmac.new(self.secret_key.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    def dispatch_request(self, http_method):
+        session = requests.Session()
+        session.headers.update(
+            {"Content-Type": "application/json;charset=utf-8", "X-MBX-APIKEY": self.api_key}
+        )
+        return {
+            "GET": session.get,
+            "DELETE": session.delete,
+            "PUT": session.put,
+            "POST": session.post,
+        }.get(http_method, "GET")
+
+    def send_public_request(self, http_method='', url_path='', payload=None):
+        if payload is None:
+            payload = {}
+        query_string = urlencode(payload, True)
+        url = self.base_url + url_path
+        if query_string:
+            url = url + "?" + query_string
+        response = self.dispatch_request(http_method)(url=url)
+        return response.json()
+
+    def send_signed_request(self, http_method='', url_path='', payload=None):
+        if payload is None:
+            payload = {}
+        query_string = urlencode(payload, True)
+        if query_string:
+            query_string = "{}&timestamp={}".format(query_string, self.get_timestamp())
+        else:
+            query_string = "timestamp={}".format(self.get_timestamp())
+        url = self.base_url + url_path + "?" + query_string + "&signature=" + self.hashing(query_string)
+        params = {"url": url, "params": {}}
+        response = self.dispatch_request(http_method)(**params)
+        return response.json()
+
+    def generate_listen_key(self):
+        assert len(self.api_key) > 0 and len(self.secret_key) > 0, '`api_key` or `secret_key` must be valid.'
+        self.listen_key = self.send_signed_request(http_method='POST', url_path=self.listen_url)['listenKey']
+
+    def delay_listen(self):
+        if self.account_type == 'spot':
+            self.send_public_request(http_method='PUT', url_path=self.listen_url,
+                                     payload={'listenKey': self.listen_key})
+        elif self.account_type == 'swap':
+            self.send_public_request(http_method='PUT', url_path=self.listen_url)
+        else:
+            assert False, f'`delay_listen` is not defined for `{self.account_type}`.'
+
+    def delete_listen(self):
+        if self.account_type == 'spot':
+            self.send_public_request(http_method='DELETE', url_path=self.listen_url,
+                                     payload={'listenKey': self.listen_key})
+        elif self.account_type == 'swap':
+            self.send_public_request(http_method='DELETE', url_path=self.listen_url)
+        else:
+            assert False, f'`delete_listen` is not defined for `{self.account_type}`.'
+
+    def generate_websocket(self, type_ws='market'):
+        if type_ws == 'market':
+            return websocket.create_connection(self.wss_url)
+        elif type_ws == 'account':
+            if self.listen_key is None:
+                self.generate_listen_key()
+            return websocket.create_connection(f'{self.wss_url}/{self.listen_key}')
+        else:
+            assert False,  f'`generate_websocket` is not defined for `{type_ws}`.'
+
+    @staticmethod
+    def subscribe_websocket(ws, symbols, sub_type='aggTrade'):
+        ws.send(json.dumps(
+            {"method": "SUBSCRIBE", "params": list(map(lambda x: x.lower() + f'@{sub_type}', symbols)), "id": 1}))
+
+    @staticmethod
+    def unsubscribe_websocket(ws, symbols, sub_type='aggTrade'):
+        ws.send(
+            json.dumps(
+                {"method": "UNSUBSCRIBE", "params": list(map(lambda x: x.lower() + f'@{sub_type}', symbols)),
+                 "id": 312}))
+
+    def get_exchange_info(self):
+        if self.account_type == 'spot':
+            url_path = '/api/v3/exchangeInfo'
+        elif self.account_type == 'swap':
+            url_path = '/fapi/v1/exchangeInfo'
+        else:
+            assert False, f'`get_exchange_info` is not defined for `{self.account_type}`.'
+        return self.send_public_request(http_method='GET', url_path=url_path)
+
+    def pull_account(self):
+        if self.account_type == 'spot':
+            url_path = '/api/v3/account'
+        elif self.account_type == 'swap':
+            url_path = '/fapi/v2/account'
+        else:
+            assert False, f'`pull_account` is not defined for `{self.account_type}`.'
+        return self.send_signed_request(http_method='GET', url_path=url_path)
+
+    def get_position(self):
+        assert self.account_type == 'swap'
+        positions = self.send_signed_request(http_method='GET', url_path='/fapi/v2/positionRisk')
+        positions = pd.DataFrame(positions)
+        positions['positionAmt'] = positions['positionAmt'].map(float)
+        return list(map(lambda x: x[1], list(positions.T.items())))
+
+    def get_balance(self):
+        assert self.account_type == 'swap'
+        balance = self.send_signed_request(http_method='GET', url_path='/fapi/v2/balance')
+        balance = pd.DataFrame(balance)
+        balance['balance'] = balance['balance'].map(float)
+        return list(map(lambda x: x[1], list(balance.T.items())))
+
+    def new_order(self, symbol='BTCUSDT', side='BUY', type_order="LIMIT", quantity='0.1', price=None,
+                  time_in_force=None):
+        if self.account_type == 'spot':
+            url_path = '/api/v3/order'
+        elif self.account_type == 'swap':
+            url_path = '/fapi/v1/order'
+        else:
+            assert False, f'`new_order` is not defined for `{self.account_type}`.'
+        payload = pd.Series({'symbol': symbol, 'side': side, 'type': type_order, 'quantity': quantity,
+                             'price': price, 'timeInForce': time_in_force}).dropna().to_dict()
+        return self.send_signed_request(http_method='POST', url_path=url_path, payload=payload)
+
+    def cancel_order(self, symbol='BTCUSDT', order_id='25364'):
+        if self.account_type == 'spot':
+            url_path = '/api/v3/order'
+        elif self.account_type == 'swap':
+            url_path = '/fapi/v1/order'
+        else:
+            assert False, f'`cancel_order` is not defined for `{self.account_type}`.'
+        return self.send_signed_request(http_method='DELETE', url_path=url_path,
+                                        payload={'symbol': symbol, 'orderId': order_id})
+
+    def get_ticker(self, symbol=''):
+        if self.account_type == 'spot':
+            url_path = '/api/v3/ticker/24hr'
+        elif self.account_type == 'swap':
+            url_path = '/fapi/v1/ticker/24hr'
+        else:
+            assert False, f'`get_ticker` is not defined for `{self.account_type}`.'
+        if symbol:
+            payload = {'symbol': symbol}
+        else:
+            payload = {}
+        return self.send_public_request(http_method='GET', url_path=url_path, payload=payload)
+
+    def history_klines(self, symbol='BTCUSDT', interval='1d', start_time_utc='2024-06-18 00:00:00',
+                       end_time_utc='', limit=500):
+        if self.account_type == 'spot':
+            url_path = '/api/v3/klines'
+        elif self.account_type == 'swap':
+            url_path = '/fapi/v1/klines'
+        else:
+            assert False, f'`history_klines` is not defined for `{self.account_type}`.'
+        start_time = int(pd.Timestamp(start_time_utc).timestamp() * 1000)
+        klines = []
+        payload = {'symbol': symbol, 'interval': interval, 'limit': limit}
+        if end_time_utc:
+            payload['endTime'] = int(pd.Timestamp(end_time_utc).timestamp() * 1000)
+        while True:
+            payload['startTime'] = start_time
+            klinei = self.send_public_request(http_method='GET', url_path=url_path, payload=payload)
+            if len(klinei) > 0:
+                klines.extend(klinei)
+                start_time = klinei[-1][0] + 1000
+            if len(klinei) < limit:
+                break
+        klines = pd.DataFrame(klines).set_index(0).sort_index()
+        klines.columns = ['open', 'high', 'low', 'close', 'volume', 'close_time', 'amount', 'trades_num', 'buy_vol',
+                          'buy_amt', 'ign']
+        return klines
+
+
+if __name__ == '__main__':
+    bn_api = BinanceAPI(
+        api_key='your own api here',
+        secret_key='your own secret here',
+        account_type='spot')
+
+    # get history klines data
+    klines = bn_api.history_klines(symbol='BTCUSDT', interval='1d', start_time_utc='2020-06-18 00:00:00')
+
+    # create websocket
+    ws = bn_api.generate_websocket(type_ws='account')
+    # book 4-hours klines stream for 'BTCUSDT', 'ETHUSDT', 'SOLUSDT' and 'LINKUSDT'
+    bn_api.subscribe_websocket(ws, ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'LINKUSDT'], sub_type="kline_4h")
+
+    # send a new real-trade order to Binance: buy 0.1 'BTCUSDT' at market realtime price on Binance.
+    bn_api.new_order(symbol='BTCUSDT', side='BUY', type_order="MARKET", quantity='0.1')
